@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """
-trade_tcl_ntp_safe.py
+trade_tcl_ntp_safe_v2.py
 
-Bybit trading run helper (NTP-based time patch + re-entrant safe).
-
-Features:
-- Applies NTP-based time offset (preferred) and falls back to Bybit endpoints if needed.
-- Patches time.time() and time.time_ns() for the duration of each run so HMAC timestamps align.
-- Safe to call trade_tcl(...) multiple times inside the same Python process: global runtime
-  state is cleared and all threads/sessions are cleaned up at the end of the run.
-- Treats Bybit retCode 34040 ("not modified") as success for TPSL setting.
-- Keeps debug logging similar to the original script.
+Multi-account Bybit trading helper:
+- NTP / Bybit server time patch to align HMAC timestamps
+- Safe to call trade_tcl(...) repeatedly in same process
+- Single global "cancel" listener: type "cancel" to stop the most recent run
+- Selective timeout cleanup: only cancels orders placed by this run and only closes positions
+  that this run created (tracked via active_position_flag)
+- Uses manual signed POST for critical actions (avoids pybit POST quirks)
 
 Requirements:
     pip install ntplib requests pybit
-
-Usage:
-    from trade_tcl_ntp_safe import trade_tcl
-    trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True)
-
 """
-
+from __future__ import annotations
 import threading
 import time
 import uuid
@@ -33,21 +26,29 @@ import json
 import ntplib
 import traceback
 import gc
+from typing import Dict, Any, Optional, Set, List
 
-from pybit.unified_trading import HTTP  # your original import
+from pybit.unified_trading import HTTP
 
 # ---------------------- CONFIG ----------------------
 RECV_WINDOW_MS = 600000  # 10 minutes
 NTP_SERVERS = ["pool.ntp.org", "time.google.com", "time.cloudflare.com"]
 
 # ---------------------- Global runtime/shared state ----------------------
-# Only a rate-limit map is global; it's cleared at the start of each run
-last_request_time = {}
+# Rate limiter map (cleared each run)
+_last_request_time: Dict[str, float] = {}
 _state_lock = threading.RLock()
 
+# Global single-line input listener (only one thread for the entire process).
+# When user types "cancel", the listener will signal the most recently registered run.
+_global_input_listener_started = False
+_global_input_listener_lock = threading.Lock()
+# list of active run cancel Events in registration order (append on start, pop on cleanup)
+_global_active_run_events: List[threading.Event] = []
+
+
 # ---------------------- Time helpers ----------------------
-def _fetch_ntp_time_ms(servers=None, timeout=5):
-    """Return time from NTP server in milliseconds, or None on failure."""
+def _fetch_ntp_time_ms(servers=None, timeout=5) -> Optional[int]:
     if servers is None:
         servers = NTP_SERVERS
     client = ntplib.NTPClient()
@@ -60,8 +61,7 @@ def _fetch_ntp_time_ms(servers=None, timeout=5):
     return None
 
 
-def _fetch_bybit_server_time_ms(demo=True, timeout=5):
-    """Try several Bybit time endpoints and return server_time_ms or None."""
+def _fetch_bybit_server_time_ms(demo=True, timeout=5) -> Optional[int]:
     candidates = []
     if demo:
         candidates += [
@@ -149,41 +149,68 @@ def use_ntp_time_patch(verbose=True, ntp_servers=None, demo_fallback=True):
             print("[time-patch] restored original time() and time_ns()")
 
 
+# ---------------------- Global input listener ----------------------
+def _start_global_input_listener_once():
+    global _global_input_listener_started
+    with _global_input_listener_lock:
+        if _global_input_listener_started:
+            return
+        _global_input_listener_started = True
+
+    def _listener():
+        # runs forever; when user types "cancel" it signals the most recent active run
+        print("[input-listener] started. Type 'cancel' to stop the most recent run.")
+        while True:
+            try:
+                line = input().strip().lower()
+            except Exception:
+                # input closed or environment not interactive
+                return
+            if line == "cancel":
+                with _global_input_listener_lock:
+                    if _global_active_run_events:
+                        last_evt = _global_active_run_events[-1]
+                        last_evt.set()
+                        print("[input-listener] 'cancel' sent to most recent run.")
+                    else:
+                        print("[input-listener] no active runs to cancel.")
+            else:
+                print("[input-listener] unknown command (type 'cancel').")
+
+    t = threading.Thread(target=_listener, name="global_input_listener", daemon=True)
+    t.start()
+
+
 # ---------------------- Rate limiting helper ----------------------
-def rate_limited_request(account_name, func, *args, **kwargs):
+def rate_limited_request(account_name: str, func, *args, **kwargs):
     """
     Simple per-account 1 request/sec rate limiter.
-    Uses global last_request_time map which is reset at the start of each trade_tcl run.
+    Uses global _last_request_time map which is reset per-run by trade_tcl.
     """
     with _state_lock:
         now = time.time()
-        last = last_request_time.get(account_name)
+        last = _last_request_time.get(account_name)
         if last is not None:
             elapsed = now - last
             if elapsed < 1:
                 # sleep outside lock in small increments
                 sleep_for = 1 - elapsed
-                # release temporarily to avoid blocking other accounts
                 _state_lock.release()
                 try:
                     time.sleep(sleep_for)
                 finally:
                     _state_lock.acquire()
-        last_request_time[account_name] = time.time()
+        _last_request_time[account_name] = time.time()
     return func(*args, **kwargs)
 
 
-# ---------------------- Signature helper ----------------------
-def _make_signature(api_key, api_secret, recv_window, timestamp_ms, body_json):
+# ---------------------- Signature / manual POST helper ----------------------
+def _make_signature(api_key: str, api_secret: str, recv_window: str, timestamp_ms: str, body_json: str) -> str:
     payload = f"{timestamp_ms}{api_key}{recv_window}{body_json}"
     return hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def signed_post(base_url, api_key, api_secret, path, body, recv_window_ms=RECV_WINDOW_MS, timeout=10):
-    """
-    Send signed POST to Bybit v5 using patched time() when active.
-    Returns parsed JSON response or dict with http_status/text on non-json.
-    """
+def signed_post(base_url: str, api_key: str, api_secret: str, path: str, body: dict, recv_window_ms: int = RECV_WINDOW_MS, timeout: int = 10) -> dict:
     timestamp = str(int(time.time() * 1000))
     body_json = json.dumps(body, separators=(",", ":"))
     sign = _make_signature(api_key, api_secret, str(recv_window_ms), timestamp, body_json)
@@ -205,8 +232,7 @@ def signed_post(base_url, api_key, api_secret, path, body, recv_window_ms=RECV_W
         return {"http_status": resp.status_code, "text": resp.text}
 
 
-def make_account_actions(api_key, api_secret, demo=True, recv_window_ms=RECV_WINDOW_MS):
-    """Manual signed POST wrappers per-account (so we don't rely on pybit POST quirks)."""
+def make_account_actions(api_key: str, api_secret: str, demo: bool = True, recv_window_ms: int = RECV_WINDOW_MS):
     base = "https://api-demo.bybit.com" if demo else "https://api.bybit.com"
 
     def place_order(body):
@@ -230,13 +256,11 @@ def make_account_actions(api_key, api_secret, demo=True, recv_window_ms=RECV_WIN
     }
 
 
-# ---------------------- Safe runtime reset ----------------------
+# ---------------------- Helpers ----------------------
 def reset_runtime_state():
-    """Clear global runtime maps and attempt to encourage GC so leftover sessions/threads are freed."""
-    global last_request_time
+    """Clear global runtime maps and encourage GC."""
     with _state_lock:
-        last_request_time.clear()
-    # Attempt garbage collection - helpful if some objects reference requests sessions
+        _last_request_time.clear()
     try:
         gc.collect()
     except Exception:
@@ -244,13 +268,7 @@ def reset_runtime_state():
     print("[DEBUG] reset_runtime_state(): cleared global runtime maps and ran GC.")
 
 
-# ---------------------- Helper to fetch open orders (as before) ----------------------
-def fetch_open_orders_safe(session, symbol):
-    """
-    Try several common pybit method names to obtain open/active orders.
-    Returns a list (possibly empty) of order dicts.
-    Raises exception if none of the method calls work (bubbles last exception).
-    """
+def fetch_open_orders_safe(session, symbol: str):
     candidates = [
         "get_open_orders",
         "query_active_order",
@@ -268,7 +286,6 @@ def fetch_open_orders_safe(session, symbol):
             continue
         try:
             resp = fn(category="linear", symbol=symbol)
-            # Normalize common response shapes
             if isinstance(resp, dict):
                 result = resp.get("result")
                 if isinstance(result, dict):
@@ -291,19 +308,24 @@ def fetch_open_orders_safe(session, symbol):
 
 
 # ---------------------- Main run (re-entrant) ----------------------
-def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300):
+def trade_tcl(keys_dict: Dict[str, Dict[str, str]],
+              order_dict: Dict[str, Any],
+              tpsl_dict: Dict[str, Any],
+              demo: bool = True,
+              max_wait_seconds: int = 300) -> Dict[str, Any]:
     """
-    Main trading function (safe to call repeatedly in the same interpreter).
-
-    keys_dict: {"acc1": {"api_key": "...", "api_secret": "..."}, ...}
+    keys_dict: {"acc1":{"api_key":"...","api_secret":"..."}, ...}
     order_dict: {"coin":"BTCUSDT","side":"Buy","leverage":..,"qty1":..,"limit1":..,...}
     tpsl_dict: {"symbol":"BTCUSDT","tp1":..,"sl1":..,...}
-    demo: True -> use Bybit demo endpoints
+    demo: use demo endpoints
     """
-    # Reset global runtime state for a clean run
+    # ensure single global input listener exists
+    _start_global_input_listener_once()
+
+    # reset per-run global state
     reset_runtime_state()
 
-    # Informational check: NTP vs local drift (best-effort)
+    # informational time drift check
     try:
         ntp_ts = _fetch_ntp_time_ms()
         local_ts = int(time.time() * 1000)
@@ -322,37 +344,32 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
     except Exception:
         print("[INFO] Time check failed (exception). Continuing.")
 
-    # Use authoritative time for the duration of the run
+    # per-run containers
+    results: Dict[str, list] = {}
+    sessions: Dict[str, Any] = {}
+    actions: Dict[str, Dict[str, Any]] = {}
+    final_summary: Dict[str, Any] = {acc: {"filled": [], "canceled": [], "timeout": False, "done": False, "user_cancel": False}
+                                     for acc in keys_dict.keys()}
+    order_timestamps: Dict[str, float] = {}
+    stop_event = threading.Event()            # signals full-run stop
+    cancel_requested: Dict[str, bool] = {"flag": False}  # per-run cancel (set by input listener)
+    # map orderLinkId -> limit index for orders placed by this run
+    orderlinkid_to_limit: Dict[str, Dict[str, int]] = {acc: {} for acc in keys_dict.keys()}
+    pending_orderlinks: Dict[str, Set[str]] = {acc: set() for acc in keys_dict.keys()}
+    processed_fills: Dict[str, Set[str]] = {acc: set() for acc in keys_dict.keys()}
+    active_position_flag: Dict[str, bool] = {acc: False for acc in keys_dict.keys()}
+    lock = threading.RLock()
+    fill_events = queue.Queue()
+
+    # create a run-local cancel event and register it to global listener (most-recent semantics)
+    run_cancel_event = threading.Event()
+    with _global_input_listener_lock:
+        _global_active_run_events.append(run_cancel_event)
+
+    # We'll set price/time patch for the duration of the run
     with use_ntp_time_patch(verbose=True, ntp_servers=NTP_SERVERS, demo_fallback=True):
-        # Per-run local state (guaranteed fresh each call)
-        results = {}   # per-account placed orders list of {"orderLinkId":...}
-        sessions = {}  # per-account HTTP (pybit) session
-        actions = {}   # per-account manual POST actions (place/cancel/set)
-        final_summary = {acc: {"filled": [], "canceled": [], "timeout": False, "done": False, "user_cancel": False}
-                         for acc in keys_dict.keys()}
-        order_timestamps = {}
-        cancel_requested = {"flag": False}
-        stop_event = threading.Event()
-
-        # per-account mapping orderLinkId -> limit number
-        orderlinkid_to_limit = {acc: {} for acc in keys_dict.keys()}
-        pending_orderlinks = {acc: set() for acc in keys_dict.keys()}
-
-        # processed markers to avoid duplicate handling
-        processed_fills = {acc: set() for acc in keys_dict.keys()}
-
-        # flag indicating account currently has a monitored active position (TP/SL set)
-        active_position_flag = {acc: False for acc in keys_dict.keys()}
-
-        # lock for modifying shared structures safely
-        lock = threading.RLock()
-
-        fill_events = queue.Queue()
-
-        # ---------- Place Orders ----------
-        def place_orders(account_name, creds):
-            print(f"[DEBUG] [{account_name}] Initializing HTTP session (recv_window={RECV_WINDOW_MS})...")
-            # keep pybit session for GETs
+        # ---------- Per-account placement ----------
+        def place_orders(account_name: str, creds: Dict[str, str]):
             try:
                 session = HTTP(api_key=creds["api_key"], api_secret=creds["api_secret"], demo=demo, recv_window=RECV_WINDOW_MS)
             except TypeError:
@@ -360,14 +377,9 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
             sessions[account_name] = session
             actions[account_name] = make_account_actions(creds["api_key"], creds["api_secret"], demo=demo, recv_window_ms=RECV_WINDOW_MS)
 
-            # set leverage via signed manual POST (pybit's POST had issues)
+            # set leverage (manual POST)
             try:
-                lev_body = {
-                    "category": "linear",
-                    "symbol": order_dict["coin"],
-                    "buyLeverage": str(order_dict["leverage"]),
-                    "sellLeverage": str(order_dict["leverage"])
-                }
+                lev_body = {"category": "linear", "symbol": order_dict["coin"], "buyLeverage": str(order_dict["leverage"]), "sellLeverage": str(order_dict["leverage"])}
                 rate_limited_request(account_name, actions[account_name]["set_leverage"], lev_body)
             except Exception as e:
                 print(f"[{account_name}] ⚠️ Error setting leverage (manual): {e}")
@@ -377,19 +389,18 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
 
             for i in range(1, 4):
                 order_link_id = f"{account_name}_limit{i}_{uuid.uuid4().hex[:8]}"
+                body = {
+                    "category": "linear",
+                    "symbol": order_dict["coin"],
+                    "side": order_dict["side"],
+                    "orderType": "Limit",
+                    "qty": str(order_dict[f"qty{i}"]),
+                    "price": str(order_dict[f"limit{i}"]),
+                    "timeInForce": "GTC",
+                    "orderLinkId": order_link_id
+                }
                 try:
-                    body = {
-                        "category": "linear",
-                        "symbol": order_dict["coin"],
-                        "side": order_dict["side"],
-                        "orderType": "Limit",
-                        "qty": str(order_dict[f"qty{i}"]),
-                        "price": str(order_dict[f"limit{i}"]),
-                        "timeInForce": "GTC",
-                        "orderLinkId": order_link_id
-                    }
                     resp = rate_limited_request(account_name, actions[account_name]["place_order"], body)
-                    # check success (Bybit v5 typical success is retCode == 0)
                     if isinstance(resp, dict) and resp.get("retCode") == 0:
                         with lock:
                             results[account_name].append({"orderLinkId": order_link_id})
@@ -400,10 +411,10 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                         print(f"[{account_name}] ⚠️ Error placing Limit{i} (manual): {resp}")
                 except Exception as e:
                     print(f"[{account_name}] ⚠️ Exception placing Limit{i}: {e}")
-                # respect 1 req/sec between placement calls (rate_limited_request will throttle but keep small sleep)
+                # ensure ~1 req/sec
                 time.sleep(1)
 
-        # run placement for all accounts in parallel (join before continuing)
+        # create and join placement threads
         place_threads = []
         for acc, creds in keys_dict.items():
             t = threading.Thread(target=place_orders, args=(acc, creds), name=f"place_{acc}", daemon=False)
@@ -414,11 +425,17 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
 
         print("[DEBUG] ✅ All accounts placed orders.")
 
-        # ---------- TPSL Worker: sets TP/SL when a tracked orderLinkId fills ----------
+        # ---------- TPSL worker ----------
         def tpsl_worker():
             while not stop_event.is_set():
+                # allow external cancel via global input listener
+                if run_cancel_event.is_set():
+                    with lock:
+                        cancel_requested["flag"] = True
+                    stop_event.set()
+                    break
                 try:
-                    account_name, order_link_id = fill_events.get(timeout=1)
+                    acc, order_link_id = fill_events.get(timeout=1)
                 except queue.Empty:
                     continue
 
@@ -426,64 +443,55 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                     break
 
                 with lock:
-                    if order_link_id in processed_fills[account_name]:
+                    if order_link_id in processed_fills[acc]:
                         continue
-                    processed_fills[account_name].add(order_link_id)
+                    processed_fills[acc].add(order_link_id)
 
-                limit_num = orderlinkid_to_limit.get(account_name, {}).get(order_link_id)
+                limit_num = orderlinkid_to_limit.get(acc, {}).get(order_link_id)
                 if limit_num is None:
-                    print(f"[{account_name}] ⚠️ Unknown orderLinkId {order_link_id} in TPSL worker")
+                    print(f"[{acc}] ⚠️ Unknown orderLinkId {order_link_id} in TPSL worker")
                     continue
 
                 tp = tpsl_dict.get(f"tp{limit_num}")
                 sl = tpsl_dict.get(f"sl{limit_num}")
                 if tp is None or sl is None:
-                    print(f"[{account_name}] ⚠️ Missing TP/SL for limit {limit_num}")
+                    print(f"[{acc}] ⚠️ Missing TP/SL for limit {limit_num}")
                     continue
 
-                # set trading stop (TP/SL) via manual signed POST
                 try:
-                    body = {
-                        "category": "linear",
-                        "symbol": tpsl_dict["symbol"],
-                        "takeProfit": str(tp),
-                        "stopLoss": str(sl),
-                        "positionIdx": 0
-                    }
-                    resp = rate_limited_request(account_name, actions[account_name]["set_trading_stop"], body)
-                    code = None
-                    if isinstance(resp, dict):
-                        code = resp.get("retCode")
-                    # Treat normal success (0) and "not modified" (34040) as okay
+                    body = {"category": "linear", "symbol": tpsl_dict["symbol"], "takeProfit": str(tp), "stopLoss": str(sl), "positionIdx": 0}
+                    resp = rate_limited_request(acc, actions[acc]["set_trading_stop"], body)
+                    code = resp.get("retCode") if isinstance(resp, dict) else None
                     if code in (0, 34040):
                         with lock:
-                            final_summary[account_name]["filled"].append(f"Limit{limit_num}")
-                            active_position_flag[account_name] = True
-                        if code == 0:
-                            print(f"[{account_name}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}).")
-                        else:
-                            print(f"[{account_name}] ⚙️ Limit{limit_num} TP/SL already correct (not modified).")
-                        # Start position monitor for this account if not already running
-                        t = threading.Thread(target=position_monitor, args=(account_name,), name=f"posmon_{account_name}", daemon=False)
+                            final_summary[acc]["filled"].append(f"Limit{limit_num}")
+                            active_position_flag[acc] = True
+                        print(f"[{acc}] ✅ Limit{limit_num} filled → TP/SL set (tp={tp} sl={sl}) (code={code}).")
+                        # start position monitor for this account
+                        t = threading.Thread(target=position_monitor, args=(acc,), name=f"posmon_{acc}", daemon=False)
                         t.start()
                     else:
-                        print(f"[{account_name}] ⚠️ set_trading_stop failed: {resp}")
+                        print(f"[{acc}] ⚠️ set_trading_stop failed: {resp}")
                 except Exception as e:
-                    print(f"[{account_name}] ⚠️ Error setting TP/SL for Limit{limit_num}: {e}")
+                    print(f"[{acc}] ⚠️ Error setting TP/SL for Limit{limit_num}: {e}")
 
-        # ---------- Polling Worker: detect fills by orderLinkId ----------
+        # ---------- Polling worker ----------
         def polling_worker():
-            processed = {acc: set() for acc in keys_dict.keys()}
-
+            processed_local = {acc: set() for acc in keys_dict.keys()}
             while not stop_event.is_set():
-                for acc in keys_dict.keys():
+                # allow external cancel
+                if run_cancel_event.is_set():
+                    with lock:
+                        cancel_requested["flag"] = True
+                    stop_event.set()
+                    break
+
+                for acc in list(keys_dict.keys()):
                     if stop_event.is_set():
                         break
                     session = sessions.get(acc)
                     if session is None:
                         continue
-
-                    # skip if no pending orders for this account
                     if not pending_orderlinks[acc]:
                         continue
 
@@ -500,20 +508,17 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                             if not order_link:
                                 continue
                             found_links.add(order_link)
-
                             if order_link not in orderlinkid_to_limit.get(acc, {}):
                                 continue
-
-                            # If filled, enqueue TPSL handling (only once)
                             if str(status).lower() in ("filled", "complete", "closed"):
-                                if order_link not in processed[acc]:
-                                    processed[acc].add(order_link)
+                                if order_link not in processed_local[acc]:
+                                    processed_local[acc].add(order_link)
                                     with lock:
                                         pending_orderlinks[acc].discard(order_link)
                                     fill_events.put((acc, order_link))
                                     print(f"[DEBUG] [{acc}] Order {order_link} detected as filled (status={status}).")
 
-                        # Fallback: orders might disappear from open-orders when filled.
+                        # fallback: missing from open-orders -> check history
                         missing = set(pending_orderlinks[acc]) - found_links
                         if missing:
                             for missing_link in list(missing):
@@ -522,11 +527,7 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                 try:
                                     history_fn = getattr(session, "get_order_history", None) or getattr(session, "query_order", None) or getattr(session, "query_active_order", None) or getattr(session, "get_orders", None)
                                     if callable(history_fn):
-                                        resp = rate_limited_request(acc, history_fn,
-                                                                    category="linear",
-                                                                    symbol=tpsl_dict["symbol"],
-                                                                    orderLinkId=missing_link,
-                                                                    limit=20)
+                                        resp = rate_limited_request(acc, history_fn, category="linear", symbol=tpsl_dict["symbol"], orderLinkId=missing_link, limit=20)
                                         hist = []
                                         if isinstance(resp, dict):
                                             res = resp.get("result")
@@ -544,28 +545,31 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                                 break
                                 except Exception as e:
                                     print(f"[{acc}] ⚠️ Error checking history for {missing_link}: {e}")
-
                     except Exception as e:
                         print(f"[{acc}] ⚠️ Error polling orders: {e}")
 
-                # responsive sleep (breakable by stop_event)
+                # responsive sleep
                 for _ in range(10):
-                    if stop_event.is_set():
+                    if stop_event.is_set() or run_cancel_event.is_set():
                         break
                     time.sleep(0.1)
 
-        # ---------- Position monitor: waits until position closes, then cancels remaining limits ----------
-        def position_monitor(account_name):
+        # ---------- Position monitor ----------
+        def position_monitor(account_name: str):
             waited_for_position = False
             while not stop_event.is_set():
+                if run_cancel_event.is_set():
+                    with lock:
+                        cancel_requested["flag"] = True
+                    stop_event.set()
+                    break
+
                 if not active_position_flag.get(account_name):
                     time.sleep(0.5)
                     continue
-
                 try:
-                    pos_resp = rate_limited_request(account_name, sessions[account_name].get_positions,
-                                                    category="linear", symbol=tpsl_dict["symbol"])
-                    positions = pos_resp.get("result", {}).get("list", [])
+                    pos_resp = rate_limited_request(account_name, sessions[account_name].get_positions, category="linear", symbol=tpsl_dict["symbol"])
+                    positions = pos_resp.get("result", {}).get("list", []) if isinstance(pos_resp, dict) else []
                     size = 0.0
                     if positions:
                         try:
@@ -584,7 +588,7 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                     to_cancel = list(pending_orderlinks[account_name])
                                 for link in to_cancel:
                                     try:
-                                        cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId": link}
+                                        cancel_body = {"category": "linear", "symbol": tpsl_dict["symbol"], "orderLinkId": link}
                                         resp = rate_limited_request(account_name, actions[account_name]["cancel_order"], cancel_body)
                                         with lock:
                                             final_summary[account_name]["canceled"].append(link)
@@ -594,116 +598,139 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                                         print(f"[{account_name}] ⚠️ Error cancelling {link}: {e}")
                             except Exception as e:
                                 print(f"[{account_name}] ⚠️ Error during cancel-after-close: {e}")
-
                             with lock:
                                 active_position_flag[account_name] = False
                             return
                 except Exception as e:
                     print(f"[{account_name}] ⚠️ Error fetching positions: {e}")
                 for _ in range(5):
-                    if stop_event.is_set():
+                    if stop_event.is_set() or run_cancel_event.is_set():
                         break
                     time.sleep(0.2)
 
         # ---------- Start background threads ----------
-        threads = []
-
+        worker_threads = []
         t_poll = threading.Thread(target=polling_worker, name="polling_worker", daemon=False)
         t_poll.start()
-        threads.append(t_poll)
-
+        worker_threads.append(t_poll)
         t_tpsl = threading.Thread(target=tpsl_worker, name="tpsl_worker", daemon=False)
         t_tpsl.start()
-        threads.append(t_tpsl)
+        worker_threads.append(t_tpsl)
 
-        # ---------- User cancel listener ----------
-        def listen_for_cancel():
-            while True:
-                try:
-                    user_input = input().strip().lower()
-                except Exception:
-                    # input might be closed in some contexts
-                    break
-                if user_input == "cancel":
-                    cancel_requested["flag"] = True
-                    print("[DEBUG] Cancel requested by user.")
-                    break
-
-        t_listen = threading.Thread(target=listen_for_cancel, name="listen_for_cancel", daemon=False)
-        t_listen.start()
-        threads.append(t_listen)
-
-        # ---------- Monitor/Controller loop ----------
+        # ---------- Main controller loop ----------
         try:
             while True:
+                # if global input asked to cancel this run, mark cancel_requested
+                if run_cancel_event.is_set():
+                    with lock:
+                        cancel_requested["flag"] = True
+                    stop_event.set()
+                    break
+
                 all_done = True
                 now = time.time()
 
-                for acc in keys_dict.keys():
+                for acc in list(keys_dict.keys()):
                     if final_summary[acc]["done"]:
                         continue
 
                     if cancel_requested["flag"]:
-                        print(f"[{acc}] ⛔ User requested cancel. Cancelling outstanding orders and closing positions...")
+                        # immediate cancel+close for this run only
+                        print(f"[{acc}] ⛔ User requested cancel. Cancelling outstanding orders and closing positions (this run).")
                         try:
                             with lock:
-                                to_cancel = [o.get("orderLinkId") for o in results.get(acc, []) if o.get("orderLinkId")]
+                                to_cancel = list(pending_orderlinks[acc])
                             for olnk in to_cancel:
                                 try:
-                                    cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId":olnk}
+                                    cancel_body = {"category": "linear", "symbol": tpsl_dict["symbol"], "orderLinkId": olnk}
                                     resp = rate_limited_request(acc, actions[acc]["cancel_order"], cancel_body)
                                     with lock:
                                         final_summary[acc]["canceled"].append(olnk)
+                                        pending_orderlinks[acc].discard(olnk)
+                                    print(f"[{acc}] ❌ Cancel resp: {resp}")
                                 except Exception as e:
                                     print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
-                            # close positions (if any) using manual signed POST market close
-                            pos_info = rate_limited_request(acc, sessions[acc].get_positions,
-                                                            category="linear", symbol=tpsl_dict["symbol"])
-                            for p in pos_info.get("result", {}).get("list", []):
-                                size = float(p.get("size", 0))
-                                side = p.get("side")
-                                if size > 0:
-                                    close_side = "Sell" if side == "Buy" else "Buy"
-                                    close_body = {
-                                        "category":"linear",
-                                        "symbol": tpsl_dict["symbol"],
-                                        "side": close_side,
-                                        "orderType": "Market",
-                                        "qty": str(size),
-                                        "reduceOnly": True,
-                                        "timeInForce":"GTC",
-                                        "orderLinkId": f"close_{acc}_{int(time.time()*1000)}"
-                                    }
-                                    resp = rate_limited_request(acc, actions[acc]["place_order"], close_body)
-                                    print(f"[{acc}] 🛑 Close resp: {resp}")
+
+                            # close only positions that this run created (active_position_flag)
+                            if active_position_flag.get(acc):
+                                pos_info = rate_limited_request(acc, sessions[acc].get_positions, category="linear", symbol=tpsl_dict["symbol"])
+                                for p in pos_info.get("result", {}).get("list", []):
+                                    size = float(p.get("size", 0))
+                                    side = p.get("side")
+                                    if size > 0:
+                                        close_side = "Sell" if side == "Buy" else "Buy"
+                                        close_body = {
+                                            "category": "linear",
+                                            "symbol": tpsl_dict["symbol"],
+                                            "side": close_side,
+                                            "orderType": "Market",
+                                            "qty": str(size),
+                                            "reduceOnly": True,
+                                            "timeInForce": "GTC",
+                                            "orderLinkId": f"cancel_close_{acc}_{int(time.time() * 1000)}"
+                                        }
+                                        resp = rate_limited_request(acc, actions[acc]["place_order"], close_body)
+                                        print(f"[{acc}] 🛑 Close resp: {resp}")
+                                with lock:
+                                    active_position_flag[acc] = False
                         except Exception as e:
                             print(f"[{acc}] ⚠️ Error during cancel sequence: {e}")
+
                         final_summary[acc]["user_cancel"] = True
                         final_summary[acc]["done"] = True
                         stop_event.set()
                         continue
 
-                    # timeout handling (per-account)
+                    # timeout handling (selective)
                     if order_timestamps.get(acc) and now - order_timestamps[acc] > max_wait_seconds:
-                        print(f"[{acc}] ⏳ Timeout reached, cancelling remaining orders.")
+                        print(f"[{acc}] ⏳ Timeout reached — cancelling remaining orders placed by this run and closing this run's position (if any).")
                         try:
+                            # cancel only pending orders this run placed
                             with lock:
-                                to_cancel = [o.get("orderLinkId") for o in results.get(acc, []) if o.get("orderLinkId")]
+                                to_cancel = list(pending_orderlinks[acc])
                             for olnk in to_cancel:
                                 try:
-                                    cancel_body = {"category":"linear","symbol":tpsl_dict["symbol"], "orderLinkId":olnk}
+                                    cancel_body = {"category": "linear", "symbol": tpsl_dict["symbol"], "orderLinkId": olnk}
                                     resp = rate_limited_request(acc, actions[acc]["cancel_order"], cancel_body)
                                     with lock:
                                         final_summary[acc]["canceled"].append(olnk)
+                                        pending_orderlinks[acc].discard(olnk)
+                                    print(f"[{acc}] ❌ Cancelled (timeout) order {olnk}. resp={resp}")
                                 except Exception as e:
                                     print(f"[{acc}] ⚠️ Error cancelling {olnk}: {e}")
+
+                            # close only position opened by this run
+                            if active_position_flag.get(acc):
+                                pos_info = rate_limited_request(acc, sessions[acc].get_positions, category="linear", symbol=tpsl_dict["symbol"])
+                                for p in pos_info.get("result", {}).get("list", []):
+                                    try:
+                                        size = float(p.get("size", 0))
+                                        side = p.get("side")
+                                        if size > 0:
+                                            close_side = "Sell" if side == "Buy" else "Buy"
+                                            close_body = {
+                                                "category": "linear",
+                                                "symbol": tpsl_dict["symbol"],
+                                                "side": close_side,
+                                                "orderType": "Market",
+                                                "qty": str(size),
+                                                "reduceOnly": True,
+                                                "timeInForce": "GTC",
+                                                "orderLinkId": f"timeout_close_{acc}_{int(time.time() * 1000)}"
+                                            }
+                                            resp = rate_limited_request(acc, actions[acc]["place_order"], close_body)
+                                            print(f"[{acc}] 🛑 Timeout close resp: {resp}")
+                                    except Exception as e:
+                                        print(f"[{acc}] ⚠️ Error closing position on timeout: {e}")
+                                with lock:
+                                    active_position_flag[acc] = False
                         except Exception as e:
-                            print(f"[{acc}] ⚠️ Error during timeout cancel: {e}")
+                            print(f"[{acc}] ⚠️ Error during timeout cleanup: {e}")
                         final_summary[acc]["timeout"] = True
                         final_summary[acc]["done"] = True
                         continue
 
-                    # if there are pending orders or active position, we are not done yet
+                    # still waiting for fills or active position
                     if pending_orderlinks[acc] or active_position_flag[acc]:
                         all_done = False
                     else:
@@ -713,9 +740,9 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                     stop_event.set()
                     break
 
-                # responsive sleep
+                # small responsive sleep
                 for _ in range(10):
-                    if stop_event.is_set():
+                    if stop_event.is_set() or run_cancel_event.is_set():
                         break
                     time.sleep(0.1)
 
@@ -728,16 +755,18 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
             stop_event.set()
 
         # ------- Clean up threads and sessions -------
-        # Wait for threads to exit (with timeout). Threads created locally are non-daemon so they should exit quickly.
-        for t in threads:
-            if t.is_alive():
-                try:
-                    t.join(timeout=2)
-                except Exception:
-                    pass
+        # signal stop to workers (already set)
+        stop_event.set()
 
-        # Also join any position monitor threads (they were created dynamically)
-        # We attempt to be defensive: iterate over threading.enumerate() and join any named posmon_* or place_* threads
+        # join worker threads
+        for t in worker_threads:
+            try:
+                if t.is_alive():
+                    t.join(timeout=2)
+            except Exception:
+                pass
+
+        # Also join any posmon_*/place_* threads (best effort)
         for t in threading.enumerate():
             if t.name.startswith(("posmon_", "place_")) and t is not threading.current_thread():
                 try:
@@ -745,23 +774,28 @@ def trade_tcl(keys_dict, order_dict, tpsl_dict, demo=True, max_wait_seconds=300)
                 except Exception:
                     pass
 
-        # Close sessions if possible
+        # Close pybit underlying sessions if possible
         for acc, s in list(sessions.items()):
             try:
-                # pybit HTTP wrapper may hold a requests.Session in attribute 'session' or 'http'
                 sess_obj = getattr(s, "session", None) or getattr(s, "http", None)
                 if hasattr(sess_obj, "close"):
                     sess_obj.close()
             except Exception:
                 pass
 
-        # final garbage collect
+        # final GC
         try:
             gc.collect()
         except Exception:
             pass
 
-    # after exiting 'with', restored original time()
+    # unregister run_cancel_event from global list
+    with _global_input_listener_lock:
+        try:
+            _global_active_run_events.remove(run_cancel_event)
+        except ValueError:
+            pass
+
     print("[DEBUG] Exiting trade_tcl, summary:")
     print(json.dumps(final_summary, indent=2))
     return final_summary
