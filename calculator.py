@@ -4,7 +4,7 @@ from functools import wraps
 import gspread
 from google.oauth2.service_account import Credentials
 
-acc_size = float('10000')
+acc_size = float('2000')
 
 # ========================
 # Robust credentials loading
@@ -176,3 +176,4 @@ def tcl_calc(price1: float, price2: float, symbol: str, type: str):
     print(order_dict)
     print(tpsl_dict)
     return order_dict, tpsl_dict
+
